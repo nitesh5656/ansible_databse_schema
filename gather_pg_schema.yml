@@ -1,0 +1,81 @@
+---
+- name: Validate PostgreSQL Schema
+  hosts: all
+  gather_facts: yes
+  vars:
+    db_user: "postgres"  # PostgreSQL user
+    db_name: "sampledb"  # Database name
+    output_file: "/tmp/schema_definition.yml"  # Output file path on the target VM
+    local_output_file: "/tmp/schema_validation_status.txt"
+  tasks:
+    - name: Copy schema definition to remote host
+      ansible.builtin.copy:
+        src: "{{ output_file }}"
+        dest: "/tmp"
+
+    - name: Verify schema definition file presence
+      ansible.builtin.stat:
+        path: "/tmp/schema_definition.yml"
+      register: schema_file
+
+    - name: Fail if schema definition file is not present
+      ansible.builtin.fail:
+        msg: "Schema definition file is not present on remote host"
+      when: not schema_file.stat.exists
+
+    - name: Gather PostgreSQL schema information
+      community.postgresql.postgresql_query:
+        db: "{{ db_name }}"
+        query: >
+          SELECT table_name, column_name, data_type, is_nullable, column_default
+          FROM information_schema.columns
+          WHERE table_schema = 'sampleschema';
+      register: schema_info
+
+    - name: Print gathered schema information
+      ansible.builtin.debug:
+        var: schema_info
+
+    - name: Load schema definition from YAML
+      ansible.builtin.include_vars:
+        file: "/tmp/schema_definition.yml"
+        name: schema
+
+    - name: Debug schema variable
+      ansible.builtin.debug:
+        var: schema
+
+    - name: Validate schema against approved definition
+      vars:
+        approved_tables: "{{ schema.schema.tables | dict2items }}"
+      block:
+        - name: Check table structure
+          ansible.builtin.assert:
+            that:
+              - item.key in schema_info.query_result | map(attribute='table_name') | list
+            msg: "Table {{ item.key }} is missing in the database"
+          with_items: "{{ approved_tables }}"
+
+        - name: Check columns for each table
+          vars:
+            db_table_columns: "{{ schema_info.query_result | selectattr('table_name', 'equalto', item.key) | list }}"
+            approved_columns: "{{ item.value.columns | default([]) }}"
+          block:
+            - name: Ensure table has required columns
+              ansible.builtin.assert:
+                that:
+                  - column.name in db_table_columns | map(attribute='column_name') | list
+                msg: "Column {{ column.name }} is missing in table {{ item.key }}"
+              with_items: "{{ approved_columns }}"
+
+            - name: Validate column data types
+              ansible.builtin.assert:
+                that:
+                  - column.type == db_table_columns | selectattr('column_name', 'equalto', column.name) | map(attribute='data_type') | list | first
+                msg: "Column {{ column.name }} in table {{ item.key }} has an incorrect type"
+              with_items: "{{ approved_columns }}"
+
+    - name: Report schema validation status to local machine
+      ansible.builtin.copy:
+        content: "Schema validation completed."
+        dest: "{{ local_output_file }}"
